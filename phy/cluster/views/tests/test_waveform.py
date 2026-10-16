@@ -1,0 +1,261 @@
+"""Test views."""
+
+# ------------------------------------------------------------------------------
+# Imports
+# ------------------------------------------------------------------------------
+
+import numpy as np
+from numpy.testing import assert_allclose as ac
+from phylib.io.mock import artificial_waveforms
+from phylib.utils import Bunch, connect
+from phylib.utils.geometry import staggered_positions
+
+from phy.gui.qt import Qt
+from phy.plot.tests import key_press, key_release, mouse_click
+
+from ..waveform import WaveformView
+from . import _stop_and_close
+
+# ------------------------------------------------------------------------------
+# Test waveform view
+# ------------------------------------------------------------------------------
+
+
+def test_waveform_view(qtbot, tempdir, gui):
+    nc = 5
+    ns = 10
+
+    w = 10 + 100 * artificial_waveforms(ns, 20, nc)
+
+    def get_waveforms(cluster_id):
+        return Bunch(
+            data=w,
+            masks=np.random.uniform(low=0.0, high=1.0, size=(ns, nc)),
+            channel_ids=np.arange(nc),
+            channel_labels=[f'{ch * 10}' for ch in range(nc)],
+            channel_positions=staggered_positions(nc),
+        )
+
+    v = WaveformView(
+        waveforms={'waveforms': get_waveforms, 'mean_waveforms': get_waveforms},
+        sample_rate=10000.0,
+    )
+    with qtbot.waitExposed(v.canvas):
+        v.show()
+    v.attach(gui)
+
+    v.on_select(cluster_ids=[])
+    v.on_select(cluster_ids=[0])
+    v.on_select(cluster_ids=[0, 2, 3])
+    # Each cluster contributes one zero-axis line per channel, independently
+    # of the number of waveform traces displayed.
+    assert v.line_visual._acc.pos.shape == (3 * nc, 4)
+    # Every raw trace in one cluster shares the same retained time-axis row.
+    x_rows = v.waveform_visual._acc.items['x']
+    n_rows_per_cluster = ns * nc
+    assert len({id(row) for row in x_rows[:n_rows_per_cluster]}) == 1
+    v.on_select(cluster_ids=[0, 2])
+
+    v.toggle_waveform_overlap(True)
+    v.toggle_waveform_overlap(False)
+
+    v.toggle_show_labels(False)
+    v.toggle_show_labels(True)
+
+    v.next_waveforms_type()
+    v.previous_waveforms_type()
+    v.toggle_mean_waveforms(True)
+    v.toggle_mean_waveforms(False)
+
+    # Box scaling.
+    bs = v.boxed.box_size
+    v.increase()
+    v.decrease()
+    v.reset_scaling()
+    ac(v.boxed.box_size, bs)
+
+    bs = v.boxed.box_size
+    v.widen()
+    v.narrow()
+    ac(v.boxed.box_size, bs)
+
+    # Probe scaling.
+    bp = v.boxed.box_pos
+    v.extend_horizontally()
+    v.shrink_horizontally()
+    ac(v.boxed.box_pos, bp)
+
+    bp = v.boxed.box_pos
+    v.extend_vertically()
+    v.shrink_vertically()
+    ac(v.boxed.box_pos, bp)
+
+    a, b = v.probe_scaling
+    v.probe_scaling = (a, b * 2)
+    ac(v.probe_scaling, (a, b * 2))
+
+    a, b = v.box_scaling
+    v.box_scaling = (a * 2, b)
+    ac(v.box_scaling, (a * 2, b))
+
+    # Simulate channel selection.
+    _clicked = []
+
+    @connect(sender=v)
+    def on_select_channel(sender, channel_id=None, button=None, key=None):
+        _clicked.append((channel_id, button, key))
+
+    key_press(qtbot, v.canvas, '2')
+    mouse_click(qtbot, v.canvas, pos=(0.0, 0.0), button='Left')
+    key_release(qtbot, v.canvas, '2')
+
+    assert _clicked == [(2, 'Left', 2)]
+
+    v.set_state(v.state)
+
+    _stop_and_close(qtbot, v)
+
+
+def test_waveform_view_highlights_displayed_spike_ids_without_reloading(qtbot, gui):
+    n_spikes, n_channels, n_samples = 3, 2, 10
+    calls = []
+
+    def get_waveforms(cluster_id):
+        calls.append(cluster_id)
+        return Bunch(
+            data=artificial_waveforms(n_spikes, n_samples, n_channels),
+            spike_ids=np.array([10, 11, 12]),
+            channel_ids=np.arange(n_channels),
+            channel_positions=staggered_positions(n_channels),
+        )
+
+    v = WaveformView(
+        waveforms={'waveforms': get_waveforms, 'mean_waveforms': get_waveforms},
+        sample_rate=10000.0,
+    )
+    with qtbot.waitExposed(v.canvas):
+        v.show()
+    v.attach(gui)
+    v.on_select(cluster_ids=[0])
+    assert calls == [0]
+
+    base_color = np.asarray(v._displayed_bunchs[0].base_color)
+    v.set_highlighted_spike_ids([11, 99])
+    assert calls == [0]
+    colors = v._displayed_bunchs[0].color
+    assert colors.shape == (n_spikes * n_channels, 4)
+    np.testing.assert_array_equal(colors[:n_channels], np.tile(base_color, (n_channels, 1)))
+    np.testing.assert_array_equal(
+        colors[n_channels : 2 * n_channels],
+        np.tile(v.highlighted_spike_color, (n_channels, 1)),
+    )
+    np.testing.assert_array_equal(colors[2 * n_channels :], np.tile(base_color, (n_channels, 1)))
+
+    v.toggle_mean_waveforms(True)
+    assert not len(v._highlighted_spike_ids)
+    _stop_and_close(qtbot, v)
+
+
+def test_waveform_view_ignores_highlights_without_spike_identity(qtbot, gui):
+    n_channels = 2
+
+    def get_waveforms(cluster_id):
+        return Bunch(
+            data=artificial_waveforms(2, 10, n_channels),
+            channel_ids=np.arange(n_channels),
+            channel_positions=staggered_positions(n_channels),
+        )
+
+    v = WaveformView(waveforms=get_waveforms, sample_rate=10000.0)
+    with qtbot.waitExposed(v.canvas):
+        v.show()
+    v.attach(gui)
+    v.on_select(cluster_ids=[0])
+    v.set_highlighted_spike_ids([10])
+    assert v._displayed_bunchs[0].color == v._displayed_bunchs[0].base_color
+
+    _stop_and_close(qtbot, v)
+
+
+def test_waveform_view_rescale_on_waveforms_type(qtbot, gui):
+    nc = 5
+    ns = 10
+
+    raw = 100 * artificial_waveforms(ns, 20, nc)
+    # Mean waveforms are a thousand times smaller here, the way templates typically
+    # are next to raw traces.
+    mean = raw / 1000.0
+
+    def _waveforms(data):
+        def get_waveforms(cluster_id):
+            return Bunch(
+                data=data,
+                channel_ids=np.arange(nc),
+                channel_positions=staggered_positions(nc),
+            )
+
+        return get_waveforms
+
+    v = WaveformView(
+        waveforms={'waveforms': _waveforms(raw), 'mean_waveforms': _waveforms(mean)},
+        sample_rate=10000.0,
+    )
+    with qtbot.waitExposed(v.canvas):
+        v.show()
+    v.attach(gui)
+
+    v.on_select(cluster_ids=[0])
+    raw_max = v.data_bounds[3]
+    assert raw_max > 0
+
+    # The y axis follows the displayed waveforms type, otherwise the smaller
+    # waveforms are drawn as flat lines.
+    v.next_waveforms_type()
+    assert v.waveforms_type == 'mean_waveforms'
+    ac(v.data_bounds[3], raw_max / 1000.0, rtol=1e-5)
+
+    v.previous_waveforms_type()
+    assert v.waveforms_type == 'waveforms'
+    ac(v.data_bounds[3], raw_max, rtol=1e-5)
+
+    v.toggle_mean_waveforms(True)
+    assert v.waveforms_type == 'mean_waveforms'
+    ac(v.data_bounds[3], raw_max / 1000.0, rtol=1e-5)
+
+    v.toggle_mean_waveforms(False)
+    assert v.waveforms_type == 'waveforms'
+    ac(v.data_bounds[3], raw_max, rtol=1e-5)
+
+    v.waveforms_type = 'mean_waveforms'
+    v.plot()
+    ac(v.data_bounds[3], raw_max / 1000.0, rtol=1e-5)
+    _stop_and_close(qtbot, v)
+
+
+def test_waveform_view_type_shortcuts(qtbot, gui):
+    def get_waveforms(cluster_id):
+        return Bunch(
+            data=artificial_waveforms(2, 10, 2),
+            channel_ids=np.arange(2),
+            channel_positions=staggered_positions(2),
+        )
+
+    v = WaveformView(
+        waveforms={
+            'waveforms': get_waveforms,
+            'mean_waveforms': get_waveforms,
+            'templates': get_waveforms,
+        },
+        sample_rate=10000.0,
+    )
+    v.attach(gui)
+    v.on_select(cluster_ids=[0])
+    v.canvas.setFocus()
+
+    qtbot.keyClick(v.canvas, Qt.Key_W)
+    assert v.waveforms_type == 'mean_waveforms'
+
+    qtbot.keyClick(v.canvas, Qt.Key_W, modifier=Qt.ShiftModifier)
+    assert v.waveforms_type == 'waveforms'
+
+    _stop_and_close(qtbot, v)

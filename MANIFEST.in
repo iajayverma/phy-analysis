@@ -1,0 +1,9 @@
+include LICENSE.md
+include README.md
+
+recursive-include phy/plot/glsl *.vert *.frag *.glsl
+recursive-include phy/plot/static *.gz
+recursive-include phy/gui/static *.html *.css *.js *.ttf *.png
+recursive-include phy/apps/*/static *.json
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]

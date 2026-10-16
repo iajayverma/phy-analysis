@@ -1,0 +1,274 @@
+"""Testing the Template GUI."""
+
+# ------------------------------------------------------------------------------
+# Imports
+# ------------------------------------------------------------------------------
+
+import logging
+import re
+import unittest
+from pathlib import Path
+
+import numpy as np
+from phylib.io.model import get_template_params, load_model
+from phylib.io.tests.conftest import _make_dataset
+from phylib.utils.testing import captured_output
+
+from phy.apps.tests.test_base import BaseControllerTests, GlobalViewsTests, MinimalControllerTests
+
+from ..gui import TemplateController, TemplateFeatureView, template_describe
+
+logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------------------
+# Tests
+# ------------------------------------------------------------------------------
+
+
+def _template_controller(tempdir, dir_path, **kwargs):
+    kwargs.update(get_template_params(dir_path / 'params.py'))
+    return TemplateController(
+        config_dir=tempdir / 'config',
+        plugin_dirs=[plugins_dir()],
+        clear_cache=kwargs.pop('clear_cache', True),
+        clear_state=True,
+        enable_threading=False,
+        **kwargs,
+    )
+
+
+def test_template_describe(qtbot, tempdir):
+    model = load_model(_make_dataset(tempdir, param='dense', has_spike_attributes=False))
+    try:
+        with captured_output() as (stdout, stderr):
+            template_describe(model.dir_path / 'params.py')
+    finally:
+        model.close()
+    assert '314' in stdout.getvalue()
+
+
+def test_template_controller_close(tempdir):
+    dataset = _make_dataset(tempdir, param='dense', has_spike_attributes=False)
+    controller = _template_controller(tempdir, dataset.parent)
+    mmaps = list(controller.model.traces._mmaps)
+
+    controller.close()
+
+    assert all(arr._mmap.closed for arr in mmaps)
+
+
+def test_template_controller_without_templates_uses_stored_waveform_channels(qtbot, tempdir):
+    dataset = _make_dataset(tempdir, param='dense', has_spike_attributes=False)
+    model = load_model(dataset)
+    spike_clusters = model.spike_clusters.copy()
+    cluster_ids = np.unique(spike_clusters)[:2]
+    spike_ids = np.concatenate(
+        [np.flatnonzero(spike_clusters == cluster_id)[:2] for cluster_id in cluster_ids]
+    )
+    model.close()
+
+    n_samples = 20
+    channel_ids = np.array(((2, 3), (2, 3), (7, 6), (7, 6)), dtype=np.int32)
+    waveforms = np.zeros((4, n_samples, 2), dtype=np.float32)
+    ramp = np.linspace(-1, 1, n_samples)
+    waveforms[:, :, 0] = 5 * ramp
+    waveforms[:, :, 1] = 2 * ramp
+    np.save(tempdir / '_phy_spikes_subset.waveforms.npy', waveforms)
+    np.save(tempdir / '_phy_spikes_subset.channels.npy', channel_ids)
+    np.save(tempdir / '_phy_spikes_subset.spikes.npy', spike_ids)
+    (tempdir / 'templates.npy').unlink()
+
+    controller = _template_controller(tempdir, dataset.parent)
+    probe = controller.create_probe_view()
+    try:
+        assert controller.model.n_samples_waveforms == n_samples
+        assert list(controller.get_best_channels(cluster_ids[0])) == [2, 3]
+        assert list(controller.get_best_channels(cluster_ids[1])) == [7, 6]
+        assert controller._get_waveforms(cluster_ids[0]).data.shape == (2, n_samples, 2)
+
+        first_positions, _ = probe._get_clu_positions([cluster_ids[0]])
+        second_positions, _ = probe._get_clu_positions([cluster_ids[1]])
+        assert not np.array_equal(first_positions, second_positions)
+    finally:
+        probe.canvas.close()
+        controller.close()
+
+
+class TemplateControllerTests(GlobalViewsTests, BaseControllerTests):
+    """Base template controller tests."""
+
+    @classmethod
+    def _create_dataset(cls, tempdir):  # pragma: no cover
+        """To be overridden in child classes."""
+        raise NotImplementedError()
+
+    @classmethod
+    def get_controller(cls, tempdir):
+        cls._dataset = cls._create_dataset(tempdir)
+        return _template_controller(tempdir, cls._dataset.parent)
+
+    @property
+    def template_feature_view(self):
+        return self.gui.list_views(TemplateFeatureView)[0]
+
+    def test_template_feature_view_split(self):
+        self.next()
+        self.next()
+        self.assertEqual(len(self.selected), 2)
+        # Need 2 selected clusters to split in the template feature view.
+
+        n = max(self.cluster_ids)
+        self.lasso(self.template_feature_view)
+        self.split()
+
+        # Split one cluster => Two new clusters should be selected after the split.
+        self.assertTrue((n + 1) in self.selected)
+
+    def test_template_split_init(self):
+        self.supervisor.actions.split_init()
+
+    def test_spike_attribute_views(self):
+        """Open all available spike attribute views."""
+        view_names = [
+            name for name in self.controller.view_creator.keys() if name.startswith('Spike')
+        ]
+        for name in view_names:
+            self.gui.create_and_add_view(name)
+            self.qtbot.wait(250)
+
+
+class TemplateControllerDenseTests(TemplateControllerTests, unittest.TestCase):
+    """Template controller with a dense dataset."""
+
+    @classmethod
+    def _create_dataset(cls, tempdir):
+        return _make_dataset(tempdir, param='dense', has_spike_attributes=False)
+
+    def test_amplitude_view(self):
+        """Change the amplitude type in the amplitude view."""
+        self.next()
+        for _ in range(4):
+            self.amplitude_view.next_amplitudes_type()
+        self.amplitude_view.previous_amplitudes_type()
+
+    def test_z1_close_reopen(self):
+        cluster_ids = self.cluster_ids
+        spike_clusters = self.supervisor.clustering.spike_clusters
+
+        # Save.
+        self.supervisor.save()
+
+        # Close the GUI.
+        self.__class__._close_gui()
+        self.__class__._controller.close()
+
+        # Recreate the controller from the saved dataset.
+        self.__class__._controller = _template_controller(
+            self.__class__._tempdir, self.__class__._dataset.parent, clear_cache=False
+        )
+        self.__class__._create_gui()
+
+        # Check that the data has been saved.
+        self.assertTrue(np.all(self.cluster_ids == cluster_ids))
+        self.assertTrue(np.all(self.supervisor.clustering.spike_clusters == spike_clusters))
+
+        # Check the label.
+        for cl, val in self.model.metadata[self.__class__._label_name].items():
+            self.assertEqual(val, self.__class__._label_value)
+
+
+class TemplateControllerSparseTests(TemplateControllerTests, unittest.TestCase):
+    """Template controller with a sparse dataset."""
+
+    @classmethod
+    def _create_dataset(cls, tempdir):
+        return _make_dataset(tempdir, param='sparse')
+
+
+class TemplateControllerMiscTests(TemplateControllerTests, unittest.TestCase):
+    """Template controller with a misc model."""
+
+    @classmethod
+    def _create_dataset(cls, tempdir):
+        return _make_dataset(tempdir, param='misc')
+
+    def test_a1_template_similarity(self):
+        self.cluster_view.sort_by('id', 'desc')
+        cl = 63
+        self.supervisor.select_actions.select(cl)
+        self.next()
+        self.similarity_view.sort_by('id', 'desc')
+
+        self.assertEqual(self.selected, [cl])
+
+        self.next()
+        self.assertEqual(self.selected, [cl, cl - 1])
+
+        self.next()
+        self.assertEqual(self.selected, [cl, cl - 2])
+
+        self.merge()
+
+        self.next_best()
+        self.next()
+        self.assertEqual(self.selected, [cl - 1, cl + 1])
+
+    def test_template_feature_view_split(self):
+        # NOTE; the misc dataset has no template_features.
+        return
+
+
+# ------------------------------------------------------------------------------
+# Test plugins
+# ------------------------------------------------------------------------------
+
+
+def plugins_dir():
+    """Path to the directory with the builtin plugins."""
+    return (Path(__file__).parent / '../../../../plugins').resolve()
+
+
+def plugin_paths():
+    """Iterate over the plugin files."""
+    assert plugins_dir().exists()
+    yield from sorted(plugins_dir().glob('*.py'))
+
+
+def plugin_names():
+    """Iterate over the builtin plugin names."""
+    pattern = re.compile(r'class (\w+)\(IPlugin\)\:')
+    for plugin_path in plugin_paths():
+        yield pattern.search(Path(plugin_path).read_text()).group(1)
+
+
+def _make_plugin_test_case(plugin_name):
+    """Generate a special test class with a plugin attached to the controller."""
+
+    class TemplateControllerPluginTests(MinimalControllerTests, unittest.TestCase):
+        @classmethod
+        def _create_dataset(cls, tempdir):
+            return _make_dataset(tempdir, param='dense', has_spike_attributes=False)
+
+        @classmethod
+        def get_controller(cls, tempdir):
+            cls._dataset = cls._create_dataset(tempdir)
+            return _template_controller(tempdir, cls._dataset.parent, plugins=[plugin_name])
+
+        def test_a1_plugin_attached(self):
+            """Check that the plugin has been attached."""
+            self.assertTrue(plugin_name in self.controller.attached_plugins)
+
+        def test_a2_minimal(self):
+            """Select one cluster."""
+            self.supervisor.reset_wizard()
+            self.next_best()
+            self.next()
+            self.assertEqual(len(self.selected), 2)
+
+    return TemplateControllerPluginTests
+
+
+# Dynamically define test classes for each builtin plugin.
+for plugin_name in plugin_names():
+    globals()[f'TemplateController{plugin_name}Tests'] = _make_plugin_test_case(plugin_name)

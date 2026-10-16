@@ -1,0 +1,1861 @@
+"""Qt widgets for GUIs."""
+
+
+# -----------------------------------------------------------------------------
+# Imports
+# -----------------------------------------------------------------------------
+
+import ast
+import inspect
+import json
+import logging
+import math
+import re
+from collections.abc import Mapping
+from contextlib import contextmanager
+from functools import partial
+
+import numpy as np
+from phylib.utils import connect, emit
+from phylib.utils._misc import _CustomEncoder, _pretty_floats
+from phylib.utils._types import _is_integer
+from qtconsole.inprocess import QtInProcessKernelManager
+from qtconsole.rich_jupyter_widget import RichJupyterWidget
+
+from phy.utils.color import _is_bright, colormaps
+from phy.utils.selection import SelectionIntent, SelectionMutation
+
+from .qt import (
+    Debouncer,
+    QAbstractItemView,
+    QAbstractTableModel,
+    QApplication,
+    QBrush,
+    QCheckBox,
+    QColor,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QDrag,
+    QEvent,
+    QGridLayout,
+    QHeaderView,
+    QItemSelectionModel,
+    QLabel,
+    QLineEdit,
+    QMimeData,
+    QModelIndex,
+    QObject,
+    QPainter,
+    QPalette,
+    QPlainTextEdit,
+    QPoint,
+    QSize,
+    QSortFilterProxyModel,
+    QSpinBox,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    Qt,
+    QTableView,
+    QTimer,
+    QVBoxLayout,
+    QWidget,
+    _block,
+)
+
+logger = logging.getLogger(__name__)
+_NO_VALUE = object()
+_CLUSTER_IDS_MIME = 'application/x-phy-cluster-ids'
+
+
+# -----------------------------------------------------------------------------
+# IPython widget
+# -----------------------------------------------------------------------------
+
+
+def _ensure_async_ipykernel_methods(kernel):
+    """Adapt synchronous in-process kernel handlers to the newer awaitable API."""
+    if kernel is None:  # pragma: no cover
+        return
+
+    do_history = getattr(kernel, 'do_history', None)
+    if do_history is not None and not inspect.iscoroutinefunction(do_history):
+
+        async def do_history_async(*args, **kwargs):
+            shell = getattr(kernel, 'shell', None)
+            if getattr(shell, 'history_manager', None) is None:
+                return {'status': 'ok', 'history': []}
+            return do_history(*args, **kwargs)
+
+        kernel.do_history = do_history_async
+
+
+class IPythonView(RichJupyterWidget):
+    """A view with an IPython console living in the same Python process as the GUI."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kernel_manager = None
+        self.kernel_client = None
+        self.kernel = None
+        self.shell = None
+
+    def start_kernel(self):
+        """Start the IPython kernel."""
+
+        logger.debug('Starting the kernel.')
+
+        self.kernel_manager = QtInProcessKernelManager()
+        self.kernel_manager.start_kernel(show_banner=False)
+        self.kernel_manager.kernel.gui = 'qt'
+        self.kernel = self.kernel_manager.kernel
+        _ensure_async_ipykernel_methods(self.kernel)
+        self.shell = self.kernel.shell
+        # This embedded shell should not persist readline history during tests or GUI teardown.
+        history_manager = getattr(self.shell, 'history_manager', None)
+        if history_manager is not None:
+            history_manager.enabled = False
+
+        try:
+            self.kernel_client = self.kernel_manager.client()
+            self.kernel_client.start_channels()
+        except Exception as e:  # pragma: no cover
+            logger.error('Could not start IPython kernel: %s.', str(e))
+
+        self.set_default_style('linux')
+        self.exit_requested.connect(self.stop)
+
+    def inject(self, **kwargs):
+        """Inject variables into the IPython namespace."""
+        logger.debug('Injecting variables into the kernel: %s.', ', '.join(kwargs.keys()))
+        try:
+            self.kernel.shell.push(kwargs)
+        except Exception as e:  # pragma: no cover
+            logger.error('Could not inject variables to the IPython kernel: %s.', str(e))
+
+    def attach(self, gui, **kwargs):
+        """Add the view to the GUI, start the kernel, and inject the specified variables."""
+        gui.add_view(self)
+        self.start_kernel()
+        self.inject(gui=gui, **kwargs)
+        try:
+            import numpy
+
+            self.inject(np=numpy)
+        except ImportError:  # pragma: no cover
+            pass
+        try:
+            import matplotlib.pyplot as plt
+
+            self.inject(plt=plt)
+        except ImportError:  # pragma: no cover
+            pass
+
+        @connect(sender=self)
+        def on_close_view(view, gui):
+            self.stop()
+
+    def stop(self):
+        """Stop the kernel."""
+        logger.debug('Stopping the kernel.')
+        kernel = self.kernel
+
+        if self.kernel_client is not None:
+            try:
+                self.kernel_client.stop_channels()
+            except Exception as e:  # pragma: no cover
+                logger.error('Could not stop IPython kernel channels: %s.', str(e))
+            self.kernel_client = None
+
+        if kernel is not None:
+            shell = getattr(kernel, 'shell', None)
+            if shell is not None:
+                try:
+                    shell._atexit_once()
+                except Exception as e:  # pragma: no cover
+                    logger.error('Could not finalize IPython shell cleanup: %s.', str(e))
+
+            for stream_name in ('stdout', 'stderr'):
+                stream = getattr(kernel, stream_name, None)
+                if stream is None:
+                    continue
+                try:
+                    stream.close()
+                except Exception as e:  # pragma: no cover
+                    logger.error(
+                        'Could not close IPython kernel %s stream: %s.',
+                        stream_name,
+                        str(e),
+                    )
+
+            iopub_thread = getattr(kernel, 'iopub_thread', None)
+            if iopub_thread is not None and getattr(iopub_thread, 'thread', None):
+                try:
+                    iopub_thread.stop()
+                except Exception as e:  # pragma: no cover
+                    logger.error('Could not stop IPython IOPub thread: %s.', str(e))
+
+        if self.kernel_manager is not None:
+            try:
+                self.kernel_manager.shutdown_kernel()
+            except Exception as e:  # pragma: no cover
+                logger.error('Could not shut down IPython kernel: %s.', str(e))
+            self.kernel_manager = None
+
+        self.kernel = None
+        self.shell = None
+
+    def closeEvent(self, event):
+        self.stop()
+        super().closeEvent(event)
+
+
+def _uniq(seq):
+    """Return the list of unique integers in a sequence, by keeping the order."""
+    seen = set()
+    seen_add = seen.add
+    return [int(x) for x in seq if not (x in seen or seen_add(x))]
+
+
+class Barrier:
+    """Implement a synchronization barrier."""
+
+    def __init__(self):
+        self._keys = []
+        self._results = {}
+        self._callback_after_all = None
+
+    def _callback(self, key, *args, **kwargs):
+        self._results[key] = (args, kwargs)
+        if self._callback_after_all and self.have_all_finished():
+            self._callback_after_all()
+
+    def __call__(self, key):
+        self._keys.append(key)
+        return partial(self._callback, key)
+
+    def have_all_finished(self):
+        """Whether all tasks have finished."""
+        return set(self._keys) == set(self._results.keys())
+
+    def wait(self):
+        """Wait until all tasks have finished."""
+        _block(self.have_all_finished)
+
+    def after_all_finished(self, callback):
+        """Specify the callback function to call after all tasks have finished."""
+        self._callback_after_all = callback
+
+    def result(self, key):
+        """Return the result of a task specified by its key."""
+        return self._results.get(key, None)
+
+
+def dumps(o):
+    """Dump a JSON object into a string, with pretty floats."""
+    return json.dumps(_pretty_floats(o), cls=_CustomEncoder)
+
+
+def _color_styles():
+    """Use colormap colors in table widget."""
+    return '\n'.join(
+        f"""
+        #table .color-{i} > td[class='id'] {{
+            background-color: rgb({r}, {g}, {b});
+            {'color: #000 !important;' if _is_bright((r, g, b)) else ''}
+        }}
+        """
+        for i, (r, g, b) in enumerate(colormaps.default * 255)
+    )
+
+
+class _TableFilterValidator(ast.NodeVisitor):
+    """Validate the supported filter-expression subset."""
+
+    _allowed_compare_ops = (
+        ast.Eq,
+        ast.NotEq,
+        ast.Lt,
+        ast.LtE,
+        ast.Gt,
+        ast.GtE,
+    )
+
+    def __init__(self, allowed_names):
+        self.allowed_names = set(allowed_names)
+
+    def visit_Expression(self, node):
+        self.visit(node.body)
+
+    def visit_BoolOp(self, node):
+        if not isinstance(node.op, (ast.And, ast.Or)):
+            raise ValueError
+        for value in node.values:
+            self.visit(value)
+
+    def visit_UnaryOp(self, node):
+        if not isinstance(node.op, ast.Not):
+            raise ValueError
+        self.visit(node.operand)
+
+    def visit_Compare(self, node):
+        self.visit(node.left)
+        for op in node.ops:
+            if not isinstance(op, self._allowed_compare_ops):
+                raise ValueError
+        for comparator in node.comparators:
+            self.visit(comparator)
+
+    def visit_Name(self, node):
+        if node.id not in self.allowed_names:
+            raise ValueError
+
+    def visit_Constant(self, node):
+        return
+
+    def generic_visit(self, node):
+        raise ValueError
+
+
+def _compile_filter_expr(expr, allowed_names):
+    """Compile a filter expression into a Python predicate."""
+    if not expr:
+        return None, False
+    translated = re.sub(r'(?<![=!<>])!(?!=)', ' not ', expr)
+    translated = translated.replace('&&', ' and ').replace('||', ' or ')
+    translated = re.sub(r'\bnull\b', 'None', translated)
+    translated = re.sub(r'\btrue\b', 'True', translated)
+    translated = re.sub(r'\bfalse\b', 'False', translated)
+    tree = ast.parse(translated, mode='eval')
+    _TableFilterValidator(allowed_names).visit(tree)
+    code = compile(tree, '<table-filter>', 'eval')
+
+    def predicate(row):
+        return bool(eval(code, {'__builtins__': {}}, row))
+
+    return predicate, True
+
+
+def _text_sort_key(value):
+    """Return a sort key that orders numeric text by value rather than character by character.
+
+    Columns such as `ch` hold channel labels, which are strings, so a plain string
+    comparison places '10' before '2'. Numeric entries sort first, in numeric order, and
+    the remaining entries keep their string ordering.
+
+    """
+    text = value if isinstance(value, str) else str(value)
+    try:
+        number = float(text)
+    except ValueError:
+        return (1, 0.0, text)
+    # NaN has no consistent ordering, so keep it with the non-numeric entries.
+    if math.isnan(number):
+        return (1, 0.0, text)
+    return (0, number, '')
+
+
+class _TableModel(QAbstractTableModel):
+    """Model backing the native Qt table."""
+
+    def __init__(self, table):
+        super().__init__(table)
+        self._table = table
+        self._rows = []
+        self._rows_by_id = {}
+        self._row_indices_by_id = {}
+
+    def rowCount(self, parent=QModelIndex()):  # noqa: B008
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):  # noqa: B008
+        return 0 if parent.isValid() else len(self._table.columns)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal and 0 <= section < len(self._table.columns):
+            return self._table.columns[section]
+        return section + 1
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        row = self._rows[index.row()]
+        column = self._table.columns[index.column()]
+        value = row.get(column)
+
+        if role in (Qt.DisplayRole, Qt.EditRole):
+            if value is None:
+                return ''
+            # Qt's model/view cannot display numpy scalars (np.int64/np.float64),
+            # which render as blank cells; convert them to native Python types.
+            if isinstance(value, np.generic):
+                value = value.item()
+            if role == Qt.DisplayRole:
+                if isinstance(value, np.ndarray):
+                    value = value.tolist()
+                if isinstance(value, (list, tuple)):
+                    return ', '.join(map(str, value))
+            # Keep the raw value available for sorting and filtering, while making
+            # spike counts easier to scan in the cluster and similarity tables.
+            if role == Qt.DisplayRole and column == 'n_spikes' and isinstance(value, int):
+                return f'{value:,}'
+            return value
+        if role == Qt.ToolTipRole:
+            return row.get(f'_{column}_tooltip') or row.get('_tooltip')
+        if role == Qt.BackgroundRole and column == 'id':
+            color = self._table._selection_background(row.get('id'))
+            if color is not None:
+                return color
+        if role == Qt.ForegroundRole:
+            fg = self._table._foreground_color(row, column)
+            if fg is not None:
+                return fg
+        return None
+
+    def flags(self, index):
+        """Advertise drag/drop support when the owning table enables it."""
+        flags = super().flags(index)
+        if index.isValid() and self._table._drag_role is not None:
+            flags |= Qt.ItemIsDragEnabled
+        if self._table._accepted_drag_roles:
+            flags |= Qt.ItemIsDropEnabled
+        return flags
+
+    def set_rows(self, rows):
+        self.beginResetModel()
+        self._rows = list(rows)
+        self._rows_by_id = {row['id']: row for row in self._rows}
+        self._row_indices_by_id = {row['id']: index for index, row in enumerate(self._rows)}
+        self.endResetModel()
+
+    def row_by_id(self, row_id):
+        return self._rows_by_id.get(row_id)
+
+    def row_index_by_id(self, row_id):
+        return self._row_indices_by_id.get(row_id)
+
+    def ids(self):
+        return [row['id'] for row in self._rows]
+
+
+class _TableProxyModel(QSortFilterProxyModel):
+    """Proxy model with typed sorting and expression filtering."""
+
+    def __init__(self, table):
+        super().__init__(table)
+        self._table = table
+        self._predicate = None
+        self.setDynamicSortFilter(True)
+
+    def set_filter_predicate(self, predicate):
+        self._predicate = predicate
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        if self._predicate is None:
+            return True
+        row = self.sourceModel()._rows[source_row]
+        try:
+            return self._predicate(row)
+        except Exception:
+            return True
+
+    def lessThan(self, left, right):
+        column = self._table.columns[left.column()]
+        left_row = self.sourceModel()._rows[left.row()]
+        right_row = self.sourceModel()._rows[right.row()]
+        left_value = left_row.get(column)
+        right_value = right_row.get(column)
+        if left_value is None and right_value is None:
+            return False
+        if left_value is None:
+            return False
+        if right_value is None:
+            return True
+        if isinstance(left_value, str) or isinstance(right_value, str):
+            return _text_sort_key(left_value) < _text_sort_key(right_value)
+        try:
+            return bool(left_value < right_value)
+        except TypeError:
+            return bool(str(left_value) < str(right_value))
+
+
+class _TableItemDelegate(QStyledItemDelegate):
+    """Custom paint delegate to preserve dark styling and selection colors."""
+
+    def __init__(self, table):
+        super().__init__(table)
+        self._table = table
+
+    def paint(self, painter, option, index):
+        row = self._table._row_for_proxy_index(index)
+        if row is None:
+            return super().paint(painter, option, index)
+
+        column = self._table.columns[index.column()]
+        row_id = row.get('id')
+        is_selected = row_id in self._table._selected_ids
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.state &= ~QStyle.State_HasFocus
+
+        palette = QPalette(opt.palette)
+        fg = self._table._foreground_color(row, column)
+        bg = None
+
+        if is_selected:
+            bg = self._table._selection_background(row_id)
+            if fg is None:
+                fg = QColor('#ffffff')
+        elif row_id == self._table._hovered_row_id:
+            bg = QColor('#222222')
+            if fg is None:
+                fg = QColor('#ffffff')
+        elif fg is None:
+            fg = QColor('#ffffff')
+
+        # Paint the selection tint ourselves for every cell in the row so Qt does not fall
+        # back to per-cell selected-item styling.
+        if bg is not None:
+            painter.save()
+            painter.fillRect(opt.rect, bg)
+            painter.restore()
+            opt.backgroundBrush = QBrush()
+            opt.state &= ~QStyle.State_Selected
+
+        if bg is not None:
+            palette.setColor(QPalette.Base, bg)
+            palette.setColor(QPalette.Highlight, bg)
+        if fg is not None:
+            palette.setColor(QPalette.Text, fg)
+            palette.setColor(QPalette.WindowText, fg)
+            palette.setColor(QPalette.HighlightedText, fg)
+        opt.palette = palette
+        super().paint(painter, opt, index)
+
+
+class _TableFilterFocusWatcher(QObject):
+    """Release the active table filter when the user clicks elsewhere."""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonPress:
+            focus_widget = QApplication.focusWidget()
+            if (
+                isinstance(focus_widget, QLineEdit)
+                and focus_widget.objectName() == 'table-filter'
+                and obj is not focus_widget
+            ):
+                focus_widget.clearFocus()
+        return super().eventFilter(obj, event)
+
+
+def _install_table_filter_focus_watcher():
+    """Install one application-owned watcher shared by all tables."""
+    app = QApplication.instance()
+    if getattr(app, '_phy_table_filter_focus_watcher', None) is None:
+        watcher = _TableFilterFocusWatcher(app)
+        app._phy_table_filter_focus_watcher = watcher
+        app.installEventFilter(watcher)
+
+
+class _TableView(QTableView):
+    """QTableView adapter for cluster-ID-only drag-and-drop intents."""
+
+    _drag_scroll_margin = 24
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self._owner = owner
+        self._drag_start_pos = None
+        self._drag_start_index = QModelIndex()
+        self._drop_insertion = None
+        self._drag_position = None
+        self._drag_scroll_direction = 0
+        self._drag_scroll_timer = QTimer(self)
+        self._drag_scroll_timer.setInterval(30)
+        self._drag_scroll_timer.timeout.connect(self._auto_scroll_drag)
+        self._drop_indicator_y = None
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._drop_indicator_y is None:
+            return
+        painter = QPainter(self.viewport())
+        painter.fillRect(0, self._drop_indicator_y, self.viewport().width(), 3, QColor('#5ca8ff'))
+        painter.end()
+
+    def startDrag(self, supported_actions):
+        index = self._drag_start_index if self._drag_start_index.isValid() else self.currentIndex()
+        ids = self._owner._drag_ids_for_index(index)
+        if not ids:
+            return
+        drag = QDrag(self)
+        drag.setMimeData(self._owner._cluster_ids_to_mime(ids))
+        index = self._drag_preview_index(index)
+        rect = self.visualRect(index)
+        if rect.isValid():
+            drag.setPixmap(self.viewport().grab(rect))
+            if self._drag_start_pos is not None:
+                drag.setHotSpot(QPoint(rect.width() // 2, self._drag_start_pos.y() - rect.top()))
+        drag.exec_(Qt.MoveAction)
+        self._clear_drop_preview()
+
+    def _drag_preview_index(self, index):
+        """Return the ID cell for a row-oriented drag preview."""
+        if not index.isValid():
+            return index
+        try:
+            column = self._owner.columns.index('id')
+        except ValueError:
+            column = 0
+        return self.model().index(index.row(), column)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        self._drag_start_pos = None
+        self._drag_start_index = QModelIndex()
+        if event.button() != Qt.LeftButton or self._owner._drag_role is None:
+            return
+        index = self.indexAt(event.pos())
+        if self._owner._drag_ids_for_index(index):
+            self._drag_start_pos = event.pos()
+            self._drag_start_index = index
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_start_pos is not None
+            and event.buttons() & Qt.LeftButton
+            and (event.pos() - self._drag_start_pos).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            self.startDrag(Qt.MoveAction)
+            self._drag_start_pos = None
+            self._drag_start_index = QModelIndex()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start_pos = None
+        self._drag_start_index = QModelIndex()
+        super().mouseReleaseEvent(event)
+
+    def dragEnterEvent(self, event):
+        if self._owner._accept_cluster_drop_event(event):
+            event.acceptProposedAction()
+        else:
+            self._clear_drop_preview()
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if not self._owner._accept_cluster_drop_event(event):
+            self._clear_drop_preview()
+            event.ignore()
+            return
+        self._update_drop_preview(event.pos())
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._clear_drop_preview()
+        event.accept()
+
+    def dropEvent(self, event):
+        source = event.source()
+        source_table = source._owner if isinstance(source, _TableView) else None
+        ids = self._owner.cluster_ids_from_mime(event.mimeData())
+        if source_table is None or not self._owner.accepts_cluster_drop(source_table, ids):
+            self._clear_drop_preview()
+            event.ignore()
+            return
+        insertion = self._drop_insertion
+        if insertion is None:
+            insertion = self._drop_insertion_for_pos(event.pos())
+        self._clear_drop_preview()
+        self._owner.emit_cluster_drop(source_table, ids, insertion)
+        event.acceptProposedAction()
+
+    def _drop_insertion_for_pos(self, pos):
+        """Return the visual row boundary immediately under a drop position."""
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return 0 if pos.y() <= 0 else len(self._owner._visible_ids())
+        rect = self.visualRect(index)
+        return index.row() + int(pos.y() >= rect.center().y())
+
+    def _update_drop_preview(self, pos):
+        """Show a non-mutating insertion target and keep edge autoscroll active."""
+        self._drag_position = QPoint(pos)
+        self._drop_insertion = self._drop_insertion_for_pos(pos)
+        self._show_drop_indicator(self._drop_insertion)
+        height = self.viewport().height()
+        if pos.y() < self._drag_scroll_margin:
+            direction = -1
+        elif pos.y() >= height - self._drag_scroll_margin:
+            direction = 1
+        else:
+            direction = 0
+        self._drag_scroll_direction = direction
+        if direction and not self._drag_scroll_timer.isActive():
+            self._drag_scroll_timer.start()
+        elif not direction:
+            self._drag_scroll_timer.stop()
+
+    def _show_drop_indicator(self, insertion):
+        if insertion >= len(self._owner._visible_ids()):
+            y = self.viewport().height() - 2
+        else:
+            index = self.model().index(insertion, 0)
+            y = self.visualRect(index).top()
+        self._drop_indicator_y = max(0, y - 1)
+        self.viewport().update()
+
+    def _auto_scroll_drag(self):
+        if self._drag_position is None or not self._drag_scroll_direction:
+            self._drag_scroll_timer.stop()
+            return
+        bar = self.verticalScrollBar()
+        step = max(1, bar.singleStep()) * self._drag_scroll_direction
+        bar.setValue(bar.value() + step)
+        self._drop_insertion = self._drop_insertion_for_pos(self._drag_position)
+        self._show_drop_indicator(self._drop_insertion)
+
+    def _clear_drop_preview(self):
+        self._drop_insertion = None
+        self._drag_position = None
+        self._drag_scroll_direction = 0
+        self._drag_scroll_timer.stop()
+        self._drop_indicator_y = None
+        self.viewport().update()
+
+
+class Table(QWidget):
+    """A sortable native Qt table with a compatibility API for legacy callers."""
+
+    _ready = False
+
+    def __init__(
+        self,
+        *args,
+        columns=None,
+        value_names=None,
+        data=None,
+        sort=None,
+        title='',
+        debounce_events=(),
+        debounce_delay=None,
+        skip_masked=True,
+    ):
+        super().__init__(*args)
+        self.setWindowTitle(title)
+        self._debouncer = Debouncer(delay=debounce_delay, parent=self)
+        self._debounce_events = set(debounce_events)
+        self._debouncer.isBusy = False
+        self.columns = list(columns or ['id'])
+        self.value_names = list(value_names or self.columns)
+        self.data = list(data or [])
+        self._selected_ids = []
+        self._hovered_row_id = None
+        self._selected_index_offset = 0
+        self._selected_index_by_id = None
+        self._selection_revision = 0
+        self._filter_text = ''
+        self._filter_is_active = False
+        self._current_sort = None
+        self._no_emit = False
+        self._batch_update_depth = 0
+        self._fit_columns_pending = False
+        self._column_widths_fitted = False
+        self._row_height_fitted = False
+        self.skip_masked = bool(skip_masked)
+        self._drag_role = None
+        self._accepted_drag_roles = set()
+        self._drag_selected_rows = True
+        self._interaction_overlay = None
+        self._interaction_blocked = False
+        self._selection_mode_before_block = None
+        self._group_colors = {
+            'good': QColor('#86D16D'),
+            'mua': QColor('#afafaf'),
+            'noise': QColor('#777777'),
+        }
+
+        self.filter_edit = QLineEdit(self)
+        self.filter_edit.setObjectName('table-filter')
+        # Accept focus only from a mouse click.  Using ``NoFocus`` and setting focus from
+        # an event filter prevents QLineEdit from completing some native mouse gestures,
+        # notably a double-click selection followed by keyboard editing.
+        self.filter_edit.setFocusPolicy(Qt.ClickFocus)
+        self.filter_edit.returnPressed.connect(self._apply_filter_from_editor)
+        self.filter_edit.installEventFilter(self)
+
+        self.table_view = _TableView(self)
+        self.table_view.viewport().installEventFilter(self)
+        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table_view.setMouseTracking(True)
+        self.table_view.viewport().setMouseTracking(True)
+        self.table_view.clicked.connect(self._on_row_clicked)
+        self.table_view.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
+        self.table_view.verticalHeader().hide()
+        self.table_view.setShowGrid(False)
+        self.table_view.setAlternatingRowColors(False)
+        self.table_view.setFocusPolicy(Qt.NoFocus)
+        self.table_view.setWordWrap(False)
+        self.table_view.horizontalHeader().setStretchLastSection(False)
+        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table_view.horizontalHeader().setSectionsMovable(True)
+        # Sorting is managed explicitly below rather than through QTableView's
+        # automatic sorting.  Keep the native header indicator in sync so the
+        # active column and direction remain visible in every table view.
+        self.table_view.horizontalHeader().setSortIndicatorShown(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.addWidget(self.filter_edit)
+        layout.addWidget(self.table_view)
+
+        self._model = _TableModel(self)
+        self._proxy = _TableProxyModel(self)
+        self._proxy.setSourceModel(self._model)
+        self.table_view.setModel(self._proxy)
+        self.table_view.setItemDelegate(_TableItemDelegate(self))
+        self._apply_dark_style()
+
+        self._init_table(columns=columns, value_names=value_names, data=data, sort=sort)
+        _install_table_filter_focus_watcher()
+
+    def configure_cluster_drag_drop(
+        self,
+        role,
+        *,
+        accepted_roles=(),
+        drag_selected_rows=True,
+    ):
+        """Enable reusable cluster-ID drag/drop and declare accepted source roles."""
+        self._drag_role = role
+        self._accepted_drag_roles = set(accepted_roles)
+        self._drag_selected_rows = bool(drag_selected_rows)
+        enabled = role is not None
+        self.table_view.setDragEnabled(enabled)
+        self.table_view.setAcceptDrops(bool(self._accepted_drag_roles))
+        self.table_view.viewport().setAcceptDrops(bool(self._accepted_drag_roles))
+        self.table_view.setDropIndicatorShown(bool(self._accepted_drag_roles))
+        self.table_view.setDefaultDropAction(Qt.MoveAction)
+        self.table_view.setDragDropMode(
+            QAbstractItemView.DragDrop if enabled else QAbstractItemView.NoDragDrop
+        )
+
+    def _set_interaction_overlay(self, text=None):
+        """Block table editing while retaining scrolling, with an explanatory overlay."""
+        blocked = bool(text)
+        if blocked == self._interaction_blocked:
+            if blocked:
+                self._interaction_overlay.setText(text)
+            return
+        self._interaction_blocked = blocked
+        if blocked:
+            self._selection_mode_before_block = self.table_view.selectionMode()
+            self.table_view.setSelectionMode(QAbstractItemView.NoSelection)
+            self.filter_edit.setEnabled(False)
+            self.table_view.horizontalHeader().setEnabled(False)
+            if self._interaction_overlay is None:
+                # Parent the overlay to the view frame, not its scrolling viewport:
+                # QAbstractScrollArea moves viewport children with its contents.
+                overlay = QLabel(self.table_view)
+                overlay.setAlignment(Qt.AlignCenter)
+                overlay.setWordWrap(True)
+                overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+                overlay.setStyleSheet(
+                    'background-color: rgba(0, 0, 0, 220); color: #dddddd; '
+                    'font-size: 18px; font-weight: bold; padding: 24px;'
+                )
+                self._interaction_overlay = overlay
+            self._interaction_overlay.setText(text)
+            self._interaction_overlay.setGeometry(self.table_view.viewport().geometry())
+            self._interaction_overlay.show()
+            self._interaction_overlay.raise_()
+        else:
+            if self._interaction_overlay is not None:
+                self._interaction_overlay.hide()
+            self.filter_edit.setEnabled(True)
+            self.table_view.horizontalHeader().setEnabled(True)
+            self.table_view.setSelectionMode(
+                self._selection_mode_before_block or QAbstractItemView.ExtendedSelection
+            )
+            self._selection_mode_before_block = None
+
+    def _drag_ids_for_index(self, index):
+        if self._drag_role is None or not index.isValid():
+            return ()
+        visible = self._visible_ids()
+        if not 0 <= index.row() < len(visible):
+            return ()
+        clicked = visible[index.row()]
+        if self._drag_selected_rows and clicked in self._selected_ids:
+            return tuple(self._selected_visible_ids())
+        return (clicked,)
+
+    @staticmethod
+    def _cluster_ids_to_mime(cluster_ids):
+        """Encode integer-like cluster IDs as native JSON integers."""
+        cluster_ids = tuple(cluster_ids)
+        if any(not _is_integer(cluster_id) for cluster_id in cluster_ids):
+            raise TypeError('Cluster drag payloads require integer IDs.')
+        mime = QMimeData()
+        mime.setData(
+            _CLUSTER_IDS_MIME,
+            json.dumps([int(cluster_id) for cluster_id in cluster_ids]).encode('utf8'),
+        )
+        return mime
+
+    @staticmethod
+    def cluster_ids_from_mime(mime):
+        """Decode and validate a cluster-ID-only MIME payload."""
+        if mime is None or not mime.hasFormat(_CLUSTER_IDS_MIME):
+            return ()
+        try:
+            ids = json.loads(bytes(mime.data(_CLUSTER_IDS_MIME)).decode('utf8'))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return ()
+        if not isinstance(ids, list) or any(not _is_integer(cluster_id) for cluster_id in ids):
+            return ()
+        return tuple(_uniq(ids))
+
+    def accepts_cluster_drop(self, source, cluster_ids):
+        """Return whether a source table and payload satisfy this table's policy."""
+        return bool(
+            cluster_ids and source is not None and source._drag_role in self._accepted_drag_roles
+        )
+
+    def _accept_cluster_drop_event(self, event):
+        source = event.source()
+        source_table = source._owner if isinstance(source, _TableView) else None
+        ids = self.cluster_ids_from_mime(event.mimeData())
+        return self.accepts_cluster_drop(source_table, ids)
+
+    def emit_cluster_drop(self, source, cluster_ids, insertion):
+        """Emit one domain-neutral transfer/reorder intent."""
+        emit(
+            'cluster_drop',
+            self,
+            {
+                'source': source,
+                'cluster_ids': tuple(cluster_ids),
+                'insertion': int(insertion),
+            },
+        )
+
+    @property
+    def debouncer(self):
+        return self._debouncer
+
+    def eventFilter(self, obj, event):
+        if obj is self.table_view.viewport() and event.type() == QEvent.Resize:
+            if self._interaction_overlay is not None:
+                self._interaction_overlay.setGeometry(self.table_view.viewport().geometry())
+        if obj is self.table_view.viewport() and event.type() == QEvent.MouseMove:
+            index = self.table_view.indexAt(event.pos())
+            row_id = self._visible_ids()[index.row()] if index.isValid() else None
+            self._set_hovered_row(row_id)
+        if obj is self.table_view.viewport() and event.type() == QEvent.Leave:
+            self._set_hovered_row(None)
+        if (
+            self._interaction_blocked
+            and obj is self.table_view.viewport()
+            and event.type()
+            in {
+                QEvent.MouseButtonPress,
+                QEvent.MouseButtonRelease,
+                QEvent.MouseButtonDblClick,
+                QEvent.MouseMove,
+            }
+        ):
+            return True
+        if (
+            obj is self.table_view.viewport()
+            and event.type() == QEvent.MouseButtonPress
+            and event.button() == Qt.RightButton
+        ):
+            # Transfer is deliberately bound only to an unmodified secondary click.
+            # Modified right-clicks are consumed without acting; they are not aliases.
+            if event.modifiers() == Qt.NoModifier:
+                index = self.table_view.indexAt(event.pos())
+                if index.isValid():
+                    emit('row_right_click', self, self._visible_ids()[index.row()])
+            # Prevent Qt's default right-click handling from changing the table selection.
+            return True
+        if (
+            obj is self.filter_edit
+            and event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_Escape
+        ):
+            self.filter_edit.clear()
+            self.filter('')
+            self.filter_edit.clearFocus()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _normalize_value_names(self, value_names):
+        names = []
+        for value_name in value_names:
+            if isinstance(value_name, str):
+                names.append(value_name)
+            elif isinstance(value_name, dict):
+                names.extend(value_name.get('data', []))
+        return names
+
+    def _apply_dark_style(self):
+        self.setStyleSheet(
+            """
+            QWidget {
+                background-color: black;
+                color: white;
+                font-size: 10pt;
+            }
+            QLineEdit#table-filter {
+                background-color: black;
+                color: white;
+                border: 1px solid #444;
+                padding: 5px;
+                selection-background-color: #444;
+                selection-color: white;
+            }
+            QTableView {
+                background-color: black;
+                color: white;
+                border: 0;
+                outline: 0;
+                selection-background-color: transparent;
+                selection-color: white;
+                gridline-color: #111;
+            }
+            QTableView::item {
+                padding: 4px 6px;
+                border: 0;
+                background-color: transparent;
+            }
+            QTableView::item:selected {
+                background-color: transparent;
+                color: white;
+            }
+            QHeaderView::section {
+                background-color: black;
+                color: white;
+                border: 0;
+                padding: 5px;
+            }
+            """
+        )
+
+    def _init_table(self, columns=None, value_names=None, data=None, sort=None):
+        columns = columns or ['id']
+        value_names = value_names or columns
+        data = data or []
+
+        self.data = list(data)
+        self.columns = list(columns)
+        self.value_names = list(value_names)
+        self._column_widths_fitted = False
+        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._filterable_names = set(self._normalize_value_names(self.value_names))
+        self._filterable_names.update(self.columns)
+
+        self._model.set_rows(self.data)
+        self._fit_columns()
+
+        emit('pre_build', self)
+        connect(event='select', sender=self, func=lambda *args: self.update(), last=True)
+        connect(event='ready', sender=self, func=lambda *args: self._set_ready())
+
+        if sort and sort[0]:
+            self.sort_by(*sort)
+        self._refresh_selection()
+        self._schedule_callback(lambda: emit('ready', self))
+
+    def _set_ready(self):
+        self._ready = True
+
+    def is_ready(self):
+        return self._ready
+
+    def _schedule_callback(self, callback, value=_NO_VALUE):
+        if callback is None:
+            return
+        if value is _NO_VALUE:
+            QTimer.singleShot(0, callback)
+        else:
+            QTimer.singleShot(0, lambda: callback(value))
+
+    def _emit_event(self, name, payload):
+        if name in self._debounce_events:
+            self._debouncer.submit(emit, name, self, payload)
+        else:
+            emit(name, self, payload)
+
+    def add_style(self, style):
+        """Append a stylesheet fragment."""
+        existing = self.styleSheet()
+        self.setStyleSheet(f'{existing}\n{style}' if existing else style)
+
+    def _source_row_for_id(self, row_id):
+        return self._model.row_index_by_id(row_id)
+
+    def _proxy_index_for_id(self, row_id, column=0):
+        source_row = self._source_row_for_id(row_id)
+        if source_row is None:
+            return QModelIndex()
+        source_index = self._model.index(source_row, column)
+        return self._proxy.mapFromSource(source_index)
+
+    def _row_for_proxy_index(self, proxy_index):
+        if not proxy_index.isValid():
+            return None
+        source_index = self._proxy.mapToSource(proxy_index)
+        if not source_index.isValid():
+            return None
+        return self._model._rows[source_index.row()]
+
+    def _fit_columns(self):
+        # Establish widths from the first populated payload, then retain them.
+        # Qt's ResizeToContents mode otherwise revisits every cell after each
+        # model reset even when the table schema and typical values are stable.
+        if not self._column_widths_fitted:
+            self.table_view.resizeColumnsToContents()
+            if self._model.rowCount():
+                self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+                self._column_widths_fitted = True
+        # With word wrapping disabled, table content does not affect row
+        # height. Measure the first populated table once, then keep that fixed
+        # height across model resets instead of visiting every row.
+        if not self._row_height_fitted and self._model.rowCount():
+            self.table_view.resizeRowsToContents()
+            vertical_header = self.table_view.verticalHeader()
+            vertical_header.setDefaultSectionSize(vertical_header.sectionSize(0))
+            vertical_header.setSectionResizeMode(QHeaderView.Fixed)
+            self._row_height_fitted = True
+
+    def _request_fit_columns(self):
+        if self._batch_update_depth:
+            self._fit_columns_pending = True
+        else:
+            self._fit_columns()
+
+    @contextmanager
+    def batch_update(self):
+        """Coalesce expensive table fitting across related mutations."""
+        self._batch_update_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_update_depth -= 1
+            if not self._batch_update_depth and self._fit_columns_pending:
+                self._fit_columns_pending = False
+                self._fit_columns()
+
+    def _visible_ids(self):
+        ids = []
+        for row in range(self._proxy.rowCount()):
+            proxy_index = self._proxy.index(row, 0)
+            source_index = self._proxy.mapToSource(proxy_index)
+            ids.append(self._model._rows[source_index.row()]['id'])
+        return ids
+
+    def _visible_row_ids(self):
+        out = []
+        for row in range(self._proxy.rowCount()):
+            proxy_index = self._proxy.index(row, 0)
+            source_index = self._proxy.mapToSource(proxy_index)
+            out.append(self._model._rows[source_index.row()]['id'])
+        return out
+
+    def _is_masked_id(self, row_id):
+        row = self._model.row_by_id(row_id)
+        return bool(row and row.get('is_masked'))
+
+    def _is_navigable_id(self, row_id):
+        return not self.skip_masked or not self._is_masked_id(row_id)
+
+    def _visible_navigable_ids(self):
+        return [row_id for row_id in self._visible_ids() if self._is_navigable_id(row_id)]
+
+    def _selected_visible_ids(self):
+        visible = set(self._visible_ids())
+        return [row_id for row_id in self._selected_ids if row_id in visible]
+
+    def _selection_background(self, row_id):
+        if row_id not in self._selected_ids:
+            return None
+        pos = self._selected_color_index(row_id)
+        colors = list(colormaps.default * 255)
+        r, g, b = colors[pos % len(colors)]
+        return QColor(int(r), int(g), int(b), 160)
+
+    def _foreground_color(self, row, column):
+        if column == 'id' and row.get('id') in self._selected_ids:
+            pos = self._selected_color_index(row.get('id'))
+            colors = list(colormaps.default * 255)
+            r, g, b = colors[pos % len(colors)]
+            if _is_bright((int(r), int(g), int(b))):
+                return QColor('#000000')
+        group = row.get('group')
+        if group in self._group_colors:
+            return self._group_colors[group]
+        if row.get('is_masked'):
+            return QColor('#888888')
+        return None
+
+    def _selected_color_index(self, row_id):
+        if self._selected_index_by_id is not None and row_id in self._selected_index_by_id:
+            return self._selected_index_by_id[row_id]
+        return self._selected_ids.index(row_id) + self._selected_index_offset
+
+    def _refresh_selection(self):
+        selection_model = self.table_view.selectionModel()
+        if selection_model is None:
+            return
+        selection_model.clearSelection()
+        for row_id in self._selected_visible_ids():
+            index = self._proxy_index_for_id(row_id)
+            if index.isValid():
+                selection_model.select(
+                    index,
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                )
+        selection_model.setCurrentIndex(QModelIndex(), QItemSelectionModel.NoUpdate)
+        self.table_view.viewport().update()
+
+    def _selected_payload(self, kwargs=None):
+        selected = self.get_selected_ids()
+        next_id = self.get_sibling_id(selected[-1] if selected else None, 'next')
+        return {
+            'selected': selected,
+            'next': next_id,
+            'kwargs': kwargs or {},
+            'revision': self._selection_revision,
+        }
+
+    def _selection_mutation(self, before_ids, intent):
+        """Describe the selection operation that just updated this table."""
+        before_ids = tuple(before_ids)
+        after_ids = tuple(self._selected_ids)
+        return SelectionMutation.create(intent, before_ids, after_ids)
+
+    def _emit_selected(self, kwargs=None, mutation=None):
+        self._selection_revision += 1
+        kwargs = dict(kwargs or {})
+        if mutation is not None:
+            # This stays in the private kwargs channel so existing consumers see
+            # the same top-level select payload.
+            kwargs['_selection_mutation'] = mutation
+        payload = self._selected_payload(kwargs)
+        self._emit_event('select', payload)
+        return payload
+
+    def _apply_filter_from_editor(self):
+        text = self.filter_edit.text().strip()
+        if re.fullmatch(r'[+-]?\d+', text):
+            row_id = int(text)
+            if self._model.row_by_id(row_id) is None:
+                logger.warning('Cluster ID %s is not present in this table.', row_id)
+                self.filter_edit.clearFocus()
+                return
+            # Exact lookup is selection, not expression filtering. Clear an existing
+            # expression so a previously hidden row can be selected and revealed.
+            self.filter('')
+            self.select((row_id,))
+            self.scroll_to(row_id, center=True)
+            self.filter_edit.clearFocus()
+            return
+        self.filter(text)
+        self.filter_edit.clearFocus()
+
+    def column_order(self):
+        """Return column names in their current visual order."""
+        header = self.table_view.horizontalHeader()
+        return [self.columns[header.logicalIndex(i)] for i in range(header.count())]
+
+    def set_column_order(self, names):
+        """Restore a visual order by name, tolerating changed plugin columns."""
+        requested = [name for name in names or () if name in self.columns]
+        order = list(dict.fromkeys(requested + self.columns))
+        header = self.table_view.horizontalHeader()
+        for visual_index, name in enumerate(order):
+            logical_index = self.columns.index(name)
+            current_visual = header.visualIndex(logical_index)
+            if current_visual != visual_index:
+                header.moveSection(current_visual, visual_index)
+
+    def _set_filter(self, text, update_text_field=True):
+        self._filter_text = text or ''
+        if update_text_field and self.filter_edit.text() != self._filter_text:
+            self.filter_edit.setText(self._filter_text)
+        if not self._filter_text:
+            self._proxy.set_filter_predicate(None)
+            self._filter_is_active = False
+            return
+        try:
+            predicate, valid = _compile_filter_expr(self._filter_text, self._filterable_names)
+        except Exception:
+            predicate, valid = None, False
+        self._proxy.set_filter_predicate(predicate if valid else None)
+        self._filter_is_active = valid
+
+    def _on_header_clicked(self, section):
+        name = self.columns[section]
+        current = self._current_sort
+        sort_dir = 'asc'
+        if current and current[0] == name and current[1] == 'asc':
+            sort_dir = 'desc'
+        self.sort_by(name, sort_dir)
+
+    def _selection_anchor_row(self):
+        visible = self._visible_ids()
+        selected = self._selected_visible_ids()
+        if not selected:
+            return None
+        return visible.index(selected[-1])
+
+    def _on_row_clicked(self, index):
+        row_id = self._visible_ids()[index.row()]
+        mods = QApplication.keyboardModifiers()
+        if mods & Qt.ControlModifier or mods & Qt.MetaModifier:
+            self.select_toggle(row_id)
+        elif mods & Qt.ShiftModifier:
+            self.select_until(row_id)
+        else:
+            self.select([row_id])
+
+    def _set_hovered_row(self, row_id):
+        """Update the row-wide hover tint without changing selection."""
+        if row_id == self._hovered_row_id:
+            return
+        self._hovered_row_id = row_id
+        self.table_view.viewport().update()
+
+    def get_selected_ids(self):
+        visible = set(self._visible_ids())
+        return [row_id for row_id in self._selected_ids if row_id in visible]
+
+    def select_toggle(self, row_id):
+        before_ids = tuple(self._selected_ids)
+        if row_id in self._selected_ids:
+            self._selected_ids.remove(row_id)
+        else:
+            self._selected_ids.append(row_id)
+        self._refresh_selection()
+        return self._emit_selected(
+            mutation=self._selection_mutation(before_ids, SelectionIntent.TOGGLE)
+        )
+
+    def select_until(self, row_id):
+        before_ids = tuple(self._selected_ids)
+        visible = self._visible_ids()
+        if row_id not in visible:
+            return None
+        anchor = self._selection_anchor_row()
+        if anchor is None:
+            return self.select([row_id], _selection_intent=SelectionIntent.EXTEND)
+        clicked = visible.index(row_id)
+        imin, imax = sorted((anchor, clicked))
+        for visible_id in visible[imin : imax + 1]:
+            if visible_id not in self._selected_ids:
+                self._selected_ids.append(visible_id)
+        self._refresh_selection()
+        return self._emit_selected(
+            mutation=self._selection_mutation(before_ids, SelectionIntent.EXTEND)
+        )
+
+    def get_sibling_id(self, row_id=None, direction='next'):
+        selected = self.get_selected_ids()
+        if row_id is None:
+            row_id = selected[0] if selected else None
+        if row_id is None:
+            return None
+        visible = self._visible_ids()
+        if row_id not in visible:
+            return None
+        step = 1 if direction == 'next' else -1
+        idx = visible.index(row_id) + step
+        while 0 <= idx < len(visible):
+            candidate = visible[idx]
+            if self._is_navigable_id(candidate):
+                return candidate
+            idx += step
+        return None
+
+    def _move_to_sibling(self, row_id=None, direction='next'):
+        if not self.get_selected_ids():
+            return self._select_first_or_last('first', _selection_intent=SelectionIntent.NAVIGATE)
+        new_id = self.get_sibling_id(row_id, direction)
+        if new_id is None:
+            return None
+        return self.select([new_id], _selection_intent=SelectionIntent.NAVIGATE)
+
+    def _select_first_or_last(self, which, **kwargs):
+        visible = self._visible_ids()
+        ordered = visible if which == 'first' else list(reversed(visible))
+        for row_id in ordered:
+            if self._is_navigable_id(row_id):
+                return self.select([row_id], **kwargs)
+        return None
+
+    def sort_by(self, name, sort_dir='asc'):
+        logger.log(5, 'Sort by `%s` %s.', name, sort_dir)
+        if name not in self.columns:
+            return
+        column = self.columns.index(name)
+        order = Qt.AscendingOrder if sort_dir == 'asc' else Qt.DescendingOrder
+        self._current_sort = (name, sort_dir)
+        # QHeaderView's stock arrow describes the next sort direction in the
+        # active Qt style.  Invert it so the displayed arrow describes the
+        # current data order: up for ascending and down for descending.
+        indicator_order = Qt.DescendingOrder if sort_dir == 'asc' else Qt.AscendingOrder
+        self.table_view.horizontalHeader().setSortIndicator(column, indicator_order)
+        self._proxy.sort(column, order)
+        self._refresh_selection()
+        self._request_fit_columns()
+        if not self._no_emit:
+            self._emit_event('table_sort', self._visible_ids())
+
+    def filter(self, text=''):
+        logger.log(5, 'Filter table with `%s`.', text)
+        self._set_filter(text, update_text_field=True)
+        self._refresh_selection()
+        self._request_fit_columns()
+        if self._filter_is_active and not self._no_emit:
+            self._emit_event('table_filter', self._visible_ids())
+
+    def _async_return(self, value, callback=None):
+        self._schedule_callback(callback, value)
+        return value
+
+    def get_ids(self, callback=None):
+        return self._async_return(self._visible_ids(), callback)
+
+    def get_navigable_ids(self, callback=None):
+        return self._async_return(self._visible_navigable_ids(), callback)
+
+    def get_next_id(self, callback=None):
+        return self._async_return(self.get_sibling_id(None, 'next'), callback)
+
+    def get_previous_id(self, callback=None):
+        return self._async_return(self.get_sibling_id(None, 'previous'), callback)
+
+    def selection_after_navigation(self, direction='next'):
+        """Return the row selection produced by navigation without mutating the table."""
+        if direction not in ('next', 'previous'):
+            raise ValueError("Direction must be 'next' or 'previous'.")
+        if not self.get_selected_ids():
+            navigable = self._visible_navigable_ids()
+            return navigable[:1]
+        row_id = self.get_sibling_id(direction=direction)
+        return [row_id] if row_id is not None else []
+
+    def first(self, callback=None):
+        return self._async_return(
+            self._select_first_or_last('first', _selection_intent=SelectionIntent.NAVIGATE),
+            callback,
+        )
+
+    def last(self, callback=None):
+        return self._async_return(
+            self._select_first_or_last('last', _selection_intent=SelectionIntent.NAVIGATE),
+            callback,
+        )
+
+    def next(self, callback=None):
+        return self._async_return(self._move_to_sibling(None, 'next'), callback)
+
+    def previous(self, callback=None):
+        return self._async_return(self._move_to_sibling(None, 'previous'), callback)
+
+    def select(self, ids, callback=None, **kwargs):
+        ids = tuple(ids)
+        before_ids = tuple(self._selected_ids)
+        intent = kwargs.pop('_selection_intent', None)
+        if intent == 'navigation':
+            intent = SelectionIntent.NAVIGATE
+        elif intent is None:
+            intent = SelectionIntent.CLEAR if not ids else SelectionIntent.REPLACE
+        if not isinstance(intent, SelectionIntent):
+            raise TypeError('_selection_intent must be a SelectionIntent.')
+        self.set_selected_ids(ids)
+        payload = self._emit_selected(
+            kwargs, mutation=self._selection_mutation(before_ids, intent)
+        )
+        return self._async_return(payload, callback)
+
+    def set_selected_ids(self, ids):
+        """Project selected row IDs without emitting a selection event."""
+        ids = _uniq(ids)
+        assert all(_is_integer(_) for _ in ids)
+        self._selected_ids = [
+            row_id for row_id in ids if self._model.row_by_id(row_id) is not None
+        ]
+        self._selection_revision += 1
+        self._refresh_selection()
+        return self._selected_payload()
+
+    def scroll_to(self, id, *, center=False):
+        index = self._proxy_index_for_id(id)
+        if index.isValid():
+            hint = (
+                QAbstractItemView.PositionAtCenter if center else QAbstractItemView.EnsureVisible
+            )
+            self.table_view.scrollTo(index, hint)
+
+    def set_busy(self, busy):
+        self.debouncer.isBusy = bool(busy)
+
+    def get(self, id, callback=None):
+        row = self._model.row_by_id(id)
+        out = dict(row) if row is not None else None
+        return self._async_return(out, callback)
+
+    def _ensure_list(self, objects):
+        if isinstance(objects, dict):
+            return [objects]
+        return list(objects)
+
+    def add(self, objects):
+        objects = self._ensure_list(objects)
+        if not objects:
+            return
+        data = self._model._rows + objects
+        self._model.set_rows(data)
+        if self._current_sort:
+            name, sort_dir = self._current_sort
+            self._proxy.sort(
+                self.columns.index(name),
+                Qt.AscendingOrder if sort_dir == 'asc' else Qt.DescendingOrder,
+            )
+        self._refresh_selection()
+        self._request_fit_columns()
+
+    def change(self, objects):
+        objects = self._ensure_list(objects)
+        if not objects:
+            return
+        changed_rows = []
+        for patch in objects:
+            row_id = patch['id']
+            row = self._model.row_by_id(row_id)
+            if row is not None:
+                row.update(patch)
+                changed_rows.append(self._model.row_index_by_id(row_id))
+        if not changed_rows:
+            return
+        if self._model.rowCount() and self._model.columnCount():
+            top_left = self._model.index(min(changed_rows), 0)
+            bottom_right = self._model.index(max(changed_rows), self._model.columnCount() - 1)
+            self._model.dataChanged.emit(top_left, bottom_right)
+        if self._current_sort:
+            self._proxy.sort(
+                self.columns.index(self._current_sort[0]),
+                Qt.AscendingOrder if self._current_sort[1] == 'asc' else Qt.DescendingOrder,
+            )
+        self._refresh_selection()
+        self._request_fit_columns()
+
+    def add_remove(self, objects, ids):
+        """Add and remove rows with one model reset, sort, and fit."""
+        objects = self._ensure_list(objects)
+        ids = set(ids)
+        if not objects and not ids:
+            return
+        self._selected_ids = [row_id for row_id in self._selected_ids if row_id not in ids]
+        data = [row for row in self._model._rows if row['id'] not in ids]
+        data.extend(objects)
+        self._model.set_rows(data)
+        if self._current_sort:
+            name, sort_dir = self._current_sort
+            self._proxy.sort(
+                self.columns.index(name),
+                Qt.AscendingOrder if sort_dir == 'asc' else Qt.DescendingOrder,
+            )
+        self._refresh_selection()
+        self._request_fit_columns()
+
+    def remove(self, ids):
+        ids = set(ids)
+        if not ids:
+            return
+        self._selected_ids = [row_id for row_id in self._selected_ids if row_id not in ids]
+        self._model.set_rows([row for row in self._model._rows if row['id'] not in ids])
+        self._refresh_selection()
+        self._request_fit_columns()
+
+    def remove_all(self):
+        self._selected_ids = []
+        self._model.set_rows([])
+        self._refresh_selection()
+        self._request_fit_columns()
+
+    def remove_all_and_add(self, objects, fit_columns=True):
+        objects = self._ensure_list(objects)
+        if not objects:
+            if fit_columns:
+                return self.remove_all()
+            self._selected_ids = []
+            self._model.set_rows([])
+            self._refresh_selection()
+            return
+        self._selected_ids = []
+        self._model.set_rows(objects)
+        if self._current_sort:
+            if fit_columns:
+                self._no_emit = True
+                self.sort_by(*self._current_sort)
+                self._no_emit = False
+            else:
+                name, sort_dir = self._current_sort
+                self._proxy.sort(
+                    self.columns.index(name),
+                    Qt.AscendingOrder if sort_dir == 'asc' else Qt.DescendingOrder,
+                )
+        self._refresh_selection()
+        if fit_columns:
+            self._request_fit_columns()
+
+    def get_selected(self, callback=None):
+        return self._async_return(self.get_selected_ids(), callback)
+
+    def get_current_sort(self, callback=None):
+        value = list(self._current_sort) if self._current_sort else None
+        return self._async_return(value, callback)
+
+    def set_selected_index_offset(self, n):
+        self._selected_index_offset = n
+        self._selected_index_by_id = None
+        self.table_view.viewport().update()
+
+    def set_selected_index_mapping(self, color_indices):
+        """Set explicit selected-row palette indices independently of role order."""
+        if not isinstance(color_indices, Mapping):
+            raise TypeError('Selected color indices must be a mapping.')
+        if any(not _is_integer(index) or index < 0 for index in color_indices.values()):
+            raise ValueError('Selected color indices must be non-negative integers.')
+        self._selected_index_by_id = dict(color_indices)
+        self.table_view.viewport().update()
+
+    def clear_temporary_files(self):
+        """Compatibility no-op kept for callers from the removed WebEngine path."""
+        return
+
+    def sizeHint(self):
+        return QSize(400, 400)
+
+    def minimumSizeHint(self):
+        return QSize(150, 150)
+
+    def eval_js(self, expr, callback=None):
+        expr = expr.strip()
+        result = None
+        emit_match = re.fullmatch(r'table\.emit\("([^"]+)",\s*(.+)\);?', expr)
+        if emit_match:
+            event_name, raw_value = emit_match.groups()
+            try:
+                result = json.loads(raw_value)
+            except Exception:
+                result = raw_value
+            self._emit_event(event_name, result)
+        elif expr == 'table.debouncer.isBusy':
+            result = self.debouncer.isBusy
+        elif expr.startswith('table._setSelectedIndexOffset('):
+            number = int(re.search(r'\((\d+)\)', expr).group(1))
+            self.set_selected_index_offset(number)
+        elif expr == 'table.selected()':
+            result = self.get_selected_ids()
+        elif expr == 'table._getIds();':
+            result = self._visible_ids()
+        elif expr == 'table._currentSort()':
+            result = list(self._current_sort) if self._current_sort else None
+        else:
+            logger.warning('Unsupported eval_js expression in native table: %s', expr)
+        self._schedule_callback(callback, result)
+        return result
+
+
+# -----------------------------------------------------------------------------
+# KeyValueWidget
+# -----------------------------------------------------------------------------
+
+
+class KeyValueWidget(QWidget):
+    """A Qt widget that displays a simple form where each field has a name, a type, and accept
+    user input."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._items = []
+        self._layout = QGridLayout(self)
+
+    def add_pair(
+        self,
+        name,
+        default=None,
+        vtype=None,
+        label=None,
+        minimum=None,
+        maximum=None,
+        decimals=None,
+        suffix=None,
+        tooltip=None,
+    ):
+        """Add a key-value pair.
+
+        Parameters
+        ----------
+
+        name : str
+        default : object
+        vtype : str
+            Can be 'str' (text box), 'int' (spin box), 'float' (spin box), 'bool' (checkbox),
+            'mutiline' (text edit for multiline str), or 'list' (several widgets).
+        """
+        if isinstance(default, list):
+            # Take lists into account.
+            for i, value in enumerate(default):
+                self.add_pair(f'{name}[{i}]', default=value, vtype=vtype)
+            return
+        if vtype is None and default is not None:
+            vtype = type(default).__name__
+        if vtype == 'str':
+            widget = QLineEdit(self)
+            widget.setText(default or '')
+        elif vtype == 'multiline':
+            widget = QPlainTextEdit(self)
+            widget.setPlainText(default or '')
+            widget.setMinimumHeight(200)
+            widget.setMaximumHeight(400)
+        elif vtype == 'int':
+            widget = QSpinBox(self)
+            widget.setMinimum(-(10**9) if minimum is None else minimum)
+            widget.setMaximum(10**9 if maximum is None else maximum)
+            widget.setValue(default or 0)
+        elif vtype == 'float':
+            widget = QDoubleSpinBox(self)
+            widget.setMinimum(-1e9 if minimum is None else minimum)
+            widget.setMaximum(+1e9 if maximum is None else maximum)
+            if decimals is not None:
+                widget.setDecimals(decimals)
+            widget.setValue(default or 0)
+        elif vtype == 'bool':
+            widget = QCheckBox(self)
+            widget.setChecked(default is True)
+        else:  # pragma: no cover
+            raise ValueError(f'Not supported vtype: {vtype}.')
+
+        if suffix and hasattr(widget, 'setSuffix'):
+            widget.setSuffix(suffix)
+        if tooltip:
+            widget.setToolTip(tooltip)
+        widget.setMaximumWidth(400)
+
+        label_widget = QLabel(label or name, self)
+        label_widget.setMaximumWidth(220)
+        if tooltip:
+            label_widget.setToolTip(tooltip)
+
+        row = len(self._items)
+        self._layout.addWidget(label_widget, row, 0)
+        self._layout.addWidget(widget, row, 1)
+        self.setLayout(self._layout)
+        self._items.append((name, vtype, default, widget))
+
+    @property
+    def names(self):
+        """List of field names."""
+        return sorted({i[0] if '[' not in i[0] else i[0][: i[0].index('[')] for i in self._items})
+
+    def get_widget(self, name):
+        """Get the widget of a field."""
+        for name_, vtype, default, widget in self._items:
+            if name == name_:
+                return widget
+
+    def get_value(self, name):
+        """Get the default or user-entered value of a field."""
+        # Detect if the requested name is a list type.
+        names = {i[0] for i in self._items}
+        if f'{name}[0]' in names:
+            out = []
+            i = 0
+            namei = f'{name}[{i}]'
+            while namei in names:
+                out.append(self.get_value(namei))
+                i += 1
+                namei = f'{name}[{i}]'
+            return out
+        for name_, vtype, default, widget in self._items:
+            if name_ == name:
+                if vtype == 'str':
+                    return str(widget.text())
+                elif vtype == 'multiline':
+                    return str(widget.toPlainText())
+                elif vtype == 'int':
+                    return int(widget.value())
+                elif vtype == 'float':
+                    return float(widget.value())
+                elif vtype == 'bool':
+                    return bool(widget.isChecked())
+
+    def attach(self, gui):  # pragma: no cover
+        """Add the view to a GUI."""
+        gui.add_view(self)
+
+    def to_dict(self):
+        """Return the key-value mapping dictionary as specified by the user inputs and defaults."""
+        return {name: self.get_value(name) for name in self.names}
+
+
+class ViewSettingsDialog(QDialog):
+    """A reusable typed settings form for view-specific parameters."""
+
+    def __init__(self, title, fields, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        layout = QVBoxLayout(self)
+        self.form = KeyValueWidget(self)
+        layout.addWidget(self.form)
+
+        for field in fields:
+            options = dict(field)
+            name = options.pop('name')
+            enabled_by = options.pop('enabled_by', None)
+            self.form.add_pair(name, **options)
+            if enabled_by:
+                controller = self.form.get_widget(enabled_by)
+                widget = self.form.get_widget(name)
+                widget.setEnabled(controller.isChecked())
+                controller.toggled.connect(widget.setEnabled)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        """Return the settings currently entered in the form."""
+        return self.form.to_dict()
+
+
+def view_settings_dialog(title, fields, parent=None, validate=None):
+    """Show a typed settings dialog and return its values, or ``None`` when cancelled.
+
+    ``validate`` may return an error message. The dialog remains open until the
+    values are valid or the user cancels it.
+    """
+    dialog = ViewSettingsDialog(title, fields, parent=parent)
+    while dialog.exec_() == QDialog.Accepted:
+        values = dialog.values()
+        error = validate(values) if validate else None
+        if not error:
+            return values
+        from .qt import message_box
+
+        message_box(error, title=title, level='warning')
+    return None
